@@ -1,0 +1,5 @@
+pyyaml
+jsonschema
+openpyxl
+pandas
+send2trash
