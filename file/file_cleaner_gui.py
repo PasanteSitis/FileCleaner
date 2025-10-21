@@ -162,20 +162,71 @@ def build_standard_name(original_filename: str, folder_path: str,
     name, ext = os.path.splitext(original_filename)
     ext = ext.lstrip('.').lower()
 
-    # Normalizar NAME (no forzar lowercase aquí; si quieres que sea lowercase, cambia despues)
-    processed_name, moved_number = process_name_for_standard(name, move_leading_number=True, number_sep='_')
+    # 1) intentar extraer prefijo+area si vienen al inicio del filename (ej "R.AP Paola..." o "R AP Paola...")
+    detected_prefix = ''
+    detected_area = ''
+    rest_name = name
 
-    # si detectamos número movido, lo pegamos al final con separator
+    m_pref_area = re.match(r'^\s*([A-Za-z0-9]{1,6})[.\s]+([A-Za-z0-9]{1,6})[.\s]+(.+)$', name)
+    if m_pref_area:
+        # ej: 'R.AP Paola...' -> pref='R', area='AP', rest='Paola...'
+        detected_prefix = m_pref_area.group(1)
+        detected_area = m_pref_area.group(2)
+        rest_name = m_pref_area.group(3)
+    else:
+        # también soportar 'R.AP.' (puntos) sin espacio: 'R.AP.Paola...'
+        m2 = re.match(r'^\s*([A-Za-z0-9]{1,6})\.([A-Za-z0-9]{1,6})\.(.+)$', name)
+        if m2:
+            detected_prefix = m2.group(1)
+            detected_area = m2.group(2)
+            rest_name = m2.group(3)
+
+    # 2) detectar sufijo numérico justo antes de la extensión (ej '...Nombre.02' -> suffix '02')
+    moved_number = None
+    m_suffix_num = re.match(r'^(.*?)[\.\s_-]*([0-9]+)$', rest_name)
+    if m_suffix_num:
+        rest_name = m_suffix_num.group(1)
+        moved_number = m_suffix_num.group(2)
+
+    # 3) normalizar NAME con la función procesadora (extrae también números compuestos si están al inicio)
+    processed_name, moved_from_start = process_name_for_standard(rest_name, move_leading_number=True)
+    # si había número movido del inicio, añadirlo al final (como ya hacíamos)
+    number_parts = []
+    if moved_from_start:
+        number_parts.append(moved_from_start)
     if moved_number:
-        processed_name = f"{processed_name}{'_' if not processed_name.endswith('_') else ''}{moved_number}"
+        number_parts.append(moved_number)
+    if number_parts:
+        # unir con _
+        suffix = "_".join(number_parts)
+        if processed_name:
+            processed_name = f"{processed_name}{'_' if not processed_name.endswith('_') else ''}{suffix}"
+        else:
+            processed_name = suffix
 
+    # escoger prefix/area: si detectamos en el filename, preferirlos; sino usar prefix_choice y area_abbr_map
+    prefix_final = detected_prefix if detected_prefix else (prefix_choice or '')
+    # obtener area por mapeo (si detectada es texto, intentar mapear a abreviación)
+    if detected_area:
+        # si detected_area es ya la abreviatura (p ej 'AP' o 'CP') la tomamos; si no, intentar mapear lowercase key
+        a = detected_area.strip()
+        # buscar en mapping keys por coincidencia simple (case-insensitive)
+        found_abbr = ''
+        for k, v in area_abbr_map.items():
+            if a.lower() == k.lower() or a.lower() == v.lower():
+                found_abbr = v
+                break
+        area_final = found_abbr if found_abbr else a
+    else:
+        area_final = find_area_abbr_in_path(folder_path, area_abbr_map) or ''
+
+    # construir reemplazos
     parent = os.path.basename(folder_path) or ''
     parent_letter = parent[0].upper() if parent else ''
-    area_abbr = find_area_abbr_in_path(folder_path, area_abbr_map) or ''
 
     replacements = {
-        '{PREFIX}': prefix_choice or '',
-        '{AREA}': area_abbr,
+        '{PREFIX}': prefix_final,
+        '{AREA}': area_final,
         '{NAME}': processed_name,
         '{EXT}': ext,
         '{PARENT_LETTER}': parent_letter
@@ -183,16 +234,16 @@ def build_standard_name(original_filename: str, folder_path: str,
     newname = pattern
     for k, v in replacements.items():
         newname = newname.replace(k, v)
-    # colapsar puntos repetidos que puedan haber quedado y limpiar
+
     newname = re.sub(r'\.+', '.', newname)
     newname = re.sub(r'_+', '_', newname)
     newname = newname.strip('. _')
 
-    # si el pattern no incluye {EXT}, añadirla
     if '{EXT}' not in pattern and ext:
         newname = f"{newname}.{ext}"
 
-    return newname, f"area:{area_abbr} parent:{parent_letter}"
+    note = f"area:{area_final} parent:{parent_letter}"
+    return newname, note
 
 
 # ---------------------------
@@ -209,9 +260,31 @@ def append_log_entries_to_file(entries: list, path: str):
     # Normalizar keys y orden
     keys = ['timestamp', 'original_path', 'action', 'new_path', 'note']
 
-    ext = os.path.splitext(path)[1].lower()
+    def relativize(p: str) -> str:
+        if not p:
+            return ''
+        # normalizar separadores
+        pp = p.replace('\\', '/')
+        # buscar 'trunk' (caso-insensible)
+        idx = pp.lower().find('/trunk/')
+        if idx >= 0:
+            return pp[idx+1:]  # devuelve inicio en 'trunk/...'
+        idx2 = pp.lower().find('trunk/')
+        if idx2 >= 0:
+            return pp[idx2:]   # por si no tiene prefijo slash
+        # si no encuentra 'trunk', devolver path relativo al drive (sin cambios)
+        return pp
+        
+    # crear copia transformada de entries con rutas relativas
+    entries_rel = []
+    for e in entries:
+        e2 = dict(e)  # copia
+        e2['original_path'] = relativize(e.get('original_path', ''))
+        e2['new_path'] = relativize(e.get('new_path', ''))
+        entries_rel.append(e2)
     
-    # Intentar usar pandas localmente
+    ext = os.path.splitext(path)[1].lower()
+    # Try pandas/openpyxl as before
     pandas_available_local = False
     try:
         import pandas as pd
@@ -219,55 +292,38 @@ def append_log_entries_to_file(entries: list, path: str):
     except Exception:
         pandas_available_local = False
 
-    # Si .xlsx y pandas disponible -> usar pandas DataFrame append/merge
     if ext == '.xlsx' and pandas_available_local:
         import pandas as pd
-        df_new = pd.DataFrame(entries).reindex(columns=keys)
+        df_new = pd.DataFrame(entries_rel).reindex(columns=keys)
         if os.path.exists(path):
             try:
                 df_old = pd.read_excel(path)
                 df_combined = pd.concat([df_old, df_new], ignore_index=True)
                 df_combined.to_excel(path, index=False)
             except Exception:
-                # si algo falla, sobrescribimos con lo nuevo
                 df_new.to_excel(path, index=False)
         else:
             df_new.to_excel(path, index=False)
         return
 
-    # Si .xlsx pero pandas no está, intentar openpyxl (escribir workbook simple)
     if ext == '.xlsx' and not pandas_available_local:
         try:
             from openpyxl import Workbook, load_workbook
-            wb = None
             if os.path.exists(path):
-                try:
-                    wb = load_workbook(path)
-                    ws = wb.active
-                    # verificar header existente
-                    headers = [c.value for c in next(ws.iter_rows(max_row=1))]
-                    # si no coincide, no importa: escribimos al final respetando keys
-                    start_row = ws.max_row + 1
-                except Exception:
-                    # crear nuevo
-                    wb = Workbook()
-                    ws = wb.active
-                    ws.append(keys)
+                wb = load_workbook(path)
+                ws = wb.active
             else:
                 wb = Workbook()
                 ws = wb.active
                 ws.append(keys)
-
-            for e in entries:
-                row = [e.get(k, '') for k in keys]
-                ws.append(row)
+            for e in entries_rel:
+                ws.append([e.get(k, '') for k in keys])
             wb.save(path)
             return
         except Exception:
-            # no hay openpyxl o falló: caer al fallback CSV
             pass
 
-    # Fallback: escribir CSV (si el usuario pidió .xlsx pero no hay librerías, genera <ruta_sin_ext>.csv)
+    # fallback CSV
     csv_path = path if ext == '.csv' else os.path.splitext(path)[0] + '.csv'
     write_header = not os.path.exists(csv_path)
     import csv
@@ -275,9 +331,8 @@ def append_log_entries_to_file(entries: list, path: str):
         writer = csv.DictWriter(f, fieldnames=keys)
         if write_header:
             writer.writeheader()
-        for e in entries:
-            row = {k: e.get(k, '') for k in keys}
-            writer.writerow(row)
+        for e in entries_rel:
+            writer.writerow({k: e.get(k, '') for k in keys})
 
 def pattern_to_regex(pattern: str):
     """Convierte un pattern con placeholders en una regex con named groups.
@@ -441,7 +496,7 @@ class FileCleanerApp:
             return
         import csv
         keys = ['timestamp','original_path','action','new_path','note']
-        combined = (self.session_preview + self.session_applied)
+        combined = [r for r in (self.session_preview + self.session_applied) if r.get('action') != 'VALIDADO_OK']
         with open(path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=keys)
             writer.writeheader()
@@ -606,8 +661,7 @@ class FileCleanerApp:
                                         if preview_only:
                                             self.session_preview.append(e)
                                         else:
-                                            self.session_applied.append(e)
-
+                                            self.session_applied.append(e) 
 
                     # 3) aplicar estándar
                     m = pattern_re.fullmatch(fname)
@@ -719,12 +773,7 @@ class FileCleanerApp:
                                     else:
                                         self.session_applied.append(e)
                         else:
-                            # ya cumple y no necesita limpieza ni cambio
-                            e = self.log_to_session(fullpath, 'VALIDADO_OK', fullpath, 'ya cumple estándar')
-                            if preview_only:
-                                self.session_preview.append(e)
-                            else:
-                                self.session_applied.append(e)
+                            pass  # ya cumple estándar, no hacer nada
                 except Exception as ex:
                     e = self.log_to_session(fullpath, 'ERROR_GENERAL', '', str(ex))
                     if preview_only:
