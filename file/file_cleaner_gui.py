@@ -32,7 +32,28 @@ def ascii_clean(name: str, lower: bool = True) -> str:
     Returns:
         str: _nombre limpio_
     """
-    n = unicodedata.normalize('NFKD', name)
+    if not name:
+        return ''
+
+    # mapeo explícito de caracteres problemáticos a su equivalente textual
+    CHAR_MAP = {
+        '¢': 'o',
+        '©': 'c',
+        '®': 'r',
+        '–': '-',  # guion largo a guion medio
+        '—': '-',  # em dash
+        '’': "'",  # apóstrofe tipográfico a simple
+        '‘': "'",
+        '“': '"',
+        '”': '"',
+        'ß': 'ss'
+    }
+        
+    s = name
+    for src, tgt in CHAR_MAP.items():
+        s = s.replace(src, tgt)
+
+    n = unicodedata.normalize('NFKD', s)
     n = n.encode('ASCII', 'ignore').decode('ASCII')
     # Reemplazar caracteres que no sean letras/números/._- por _
     n = re.sub(r'[^\w\.\-]', '_', n)
@@ -774,6 +795,29 @@ class FileCleanerApp:
                                         self.session_applied.append(e)
                         else:
                             pass  # ya cumple estándar, no hacer nada
+                    else:
+                        # NO cumple el patrón: aplicar la lógica normal de construcción
+                        newname, note = build_standard_name(fname, root_dir, pattern, prefix_choice, area_map)
+                        if newname != fname:
+                            new_full = os.path.join(root_dir, newname)
+                            if preview_only:
+                                e = self.log_to_session(fullpath, 'ESTANDARIZAR_PREVIEW', new_full, note)
+                                self.session_preview.append(e)
+                            else:
+                                target = safe_unique_path(root_dir, newname)
+                                try:
+                                    os.rename(fullpath, target)
+                                    e = self.log_to_session(fullpath, 'ESTANDARIZADO', target, note)
+                                    self.session_applied.append(e)
+                                except Exception as ex:
+                                    e = self.log_to_session(fullpath, 'ERROR_ESTANDARIZAR', '', str(ex))
+                                    if preview_only:
+                                        self.session_preview.append(e)
+                                    else:
+                                        self.session_applied.append(e)
+                        else:
+                            # si build_standard_name devolvió el mismo nombre, no mostramos ni guardamos
+                            pass
                 except Exception as ex:
                     e = self.log_to_session(fullpath, 'ERROR_GENERAL', '', str(ex))
                     if preview_only:
