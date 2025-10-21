@@ -43,11 +43,12 @@ def ascii_clean(name: str, lower: bool = True) -> str:
 def process_name_for_standard(name: str, move_leading_number: bool = True, number_sep: str = '_') -> tuple[str, str|None]:
     """
     Normaliza la parte NAME para el estándar:
-        - convierte acentos a ascii (usa ascii_clean sin forzar lower)
+        - convierte acentos a ascii (ascii_clean sin forzar lower)
         - reemplaza '-' por '_' y todos los '.' (puntos) internos por '_'
         - colapsa '_' repetidos
-        - opcional: si name empieza con un número (ej: '123 - resto' o '123.resto' o '123_resto'),
-        extrae ese número y devuelve (name_sin_numero, number) para poder colocarlo antes de la extensión.
+        - opcional: si name empieza con una secuencia numérica (ej: '123', '24 y 25', '8-21', '24,25'),
+        extrae esa secuencia y devuelve (name_sin_numero, normalized_number) donde normalized_number
+        es la secuencia con separadores convertidos a '_', por ejemplo '24 y 25' -> '24_25'.
     Devuelve (processed_name, moved_number_or_None)
     """
     if not name:
@@ -56,21 +57,28 @@ def process_name_for_standard(name: str, move_leading_number: bool = True, numbe
     # 1) normalizar acentos sin forzar lowercase
     n = ascii_clean(name, lower=False)
 
-    # 2) detectar número al inicio: uno o más dígitos seguidos de separador (espacio, punto, guion, underscore)
     moved_number = None
     if move_leading_number:
-        mnum = re.match(r'^\s*([0-9]+)[\s\._\-]+(.+)$', n)
-        if mnum:
-            moved_number = mnum.group(1)
-            n = mnum.group(2)
+        # Regex para capturar secuencias de números al inicio separados por -,–,.,, y, and, &
+        # Ej: "24 y 25 R.AP..." -> group1 = "24 y 25", rest = "R.AP..."
+        m = re.match(r'^\s*([0-9]+(?:\s*(?:[\-–\.,]|y|and|&)\s*[0-9]+)*)\s*[-_\.\s:]*(.+)$',
+                    n, flags=re.IGNORECASE)
+        if m:
+            raw_num_seq = m.group(1)
+            rest = m.group(2)
+            # normalizar separadores a '_' y quitar espacios sobrantes
+            normalized = re.sub(r'[\s]*?(?:[\-–\.,]|y|and|&)[\s]*?', '_', raw_num_seq, flags=re.IGNORECASE)
+            normalized = re.sub(r'_+', '_', normalized).strip('_ ')
+            moved_number = normalized if normalized else None
+            n = rest
 
-    # 3) reemplazar guion medio por underscore
+    # 2) reemplazar guion medio por underscore
     n = n.replace('-', '_')
 
-    # 4) reemplazar todos los puntos por underscore (estos puntos están en el 'name' ya separado de la extensión)
+    # 3) reemplazar todos los puntos por underscore (estos puntos están en el 'name' ya separado de la extensión)
     n = n.replace('.', '_')
 
-    # 5) colapsar múltiples underscores y limpiar bordes
+    # 4) colapsar múltiples underscores y limpiar bordes
     n = re.sub(r'_+', '_', n).strip('_ ')
 
     return n, moved_number
@@ -602,97 +610,121 @@ class FileCleanerApp:
 
 
                     # 3) aplicar estándar
-                    if self.apply_standard_var.get():
-                        # 1) comprobar si el archivo ya cumple exactamente el patrón
-                        m = pattern_re.fullmatch(fname)
-                        if m:
-                            groups = m.groupdict()
-                            original_prefix = groups.get('PREFIX', '')
-                            original_area = groups.get('AREA', '')
-                            original_name_part = groups.get('NAME', '')
-                            original_ext = groups.get('EXT', '')
-                            original_parent_letter = groups.get('PARENT_LETTER', '')
+                    m = pattern_re.fullmatch(fname)
+                    if m:
+                        groups = m.groupdict()
+                        original_prefix = groups.get('PREFIX', '')
+                        original_area = groups.get('AREA', '')
+                        original_name_part = groups.get('NAME', '')
+                        original_ext = groups.get('EXT', '')
+                        original_parent_letter = groups.get('PARENT_LETTER', '')
 
-                            # obtener la abreviacion esperada en esta ruta (según el mapeo)
-                            expected_area = find_area_abbr_in_path(root_dir, area_map) or ''
-                            # Solo usar expected_prefix si el pattern lo requiere
-                            expected_prefix = prefix_choice if pattern_has_prefix else original_prefix
+                        # --- parche: si el PREFIX contiene un número al inicio (ej "11 R"), extraerlo y pasarlo al NAME ----------
+                        # detectar secuencia numérica al inicio del prefix: "123 R", "24 y 25 R", "8-21R", "24,25-R"
+                        moved_number_from_prefix = None
+                        mp = re.match(r'^\s*([0-9]+(?:\s*(?:[\-–\.,]|y|and|&)\s*[0-9]+)*)\s*[-_\.\s:]*(.*)$',
+                                    original_prefix, flags=re.IGNORECASE)
+                        if mp:
+                            raw_num_seq = mp.group(1)
+                            rest_pref = mp.group(2).strip()
+                            normalized = re.sub(r'[\s]*?(?:[\-–\.,]|y|and|&)[\s]*?', '_', raw_num_seq, flags=re.IGNORECASE)
+                            normalized = re.sub(r'_+', '_', normalized).strip('_ ')
+                            if normalized:
+                                moved_number_from_prefix = normalized
+                            original_prefix = rest_pref or original_prefix  # si no queda texto, mantenemos original (evita vacío)
+                        
+                        # Procesar NAME una única vez (extrae número si viene al inicio del NAME)
+                        processed_name_part, moved_number_from_name = process_name_for_standard(original_name_part, move_leading_number=True)
 
-                            # obtener la letra de la carpeta inmediata (esperada) sólo si pattern lo requiere
-                            parent_folder = os.path.basename(root_dir) or ''
-                            expected_parent_letter = (parent_folder[0].upper() if parent_folder else '') if pattern_has_parent else original_parent_letter
-
-                            processed_name_part, moved_number = process_name_for_standard(original_name_part, move_leading_number=True)
-                            # si hay número movido, agregarlo al final del NAME
-                            if moved_number:
-                                processed_name_part = f"{processed_name_part}{'_' if not processed_name_part.endswith('_') else ''}{moved_number}"
-                            cleaned_name_part = processed_name_part
-
-                            # decidir si debemos cambiar PREFIX/AREA/PARENT_LETTER (o sólo NAME)
-                            needs_prefix_change = pattern_has_prefix and (expected_prefix and original_prefix != expected_prefix)
-                            needs_area_change = (expected_area and original_area != expected_area)
-                            needs_parent_change = pattern_has_parent and (expected_parent_letter and original_parent_letter != expected_parent_letter)
-                            needs_name_change = (cleaned_name_part != original_name_part)
-
-                            if needs_prefix_change or needs_area_change or needs_name_change or needs_parent_change:
-                                # definir variables antes de la reconstrucción (si toca cambiar)
-                                prefix_to_use = expected_prefix if (pattern_has_prefix and expected_prefix) else original_prefix
-                                area_to_use = expected_area if expected_area else original_area
-                                parent_to_use = expected_parent_letter if (pattern_has_parent and expected_parent_letter) else original_parent_letter
-                                ext_to_use = original_ext
-
-                                # reconstruir según el pattern (sustituir placeholders)
-                                newname = pattern
-                                if pattern_has_prefix:
-                                    newname = newname.replace('{PREFIX}', prefix_to_use)
-                                newname = newname.replace('{AREA}', area_to_use)
-                                newname = newname.replace('{NAME}', cleaned_name_part)
-                                newname = newname.replace('{EXT}', ext_to_use)
-                                if pattern_has_parent:
-                                    newname = newname.replace('{PARENT_LETTER}', parent_to_use)
-                                newname = re.sub(r'\.+', '.', newname).strip('. ')
-                                new_full = os.path.join(root_dir, newname)
-
-                                # log / acciones
-                                action_preview = 'ESTANDARIZAR_REPARAR_PREFIJO_AREA_PREVIEW' if preview_only else 'ESTANDARIZAR_REPARAR_PREFIJO_AREA'
-                                if pattern_has_parent:
-                                    action_preview = action_preview.replace('PREFIJO_AREA', 'PREFIJO_AREA_PARENT')
-
-                                note_parts = []
-                                if needs_prefix_change:
-                                    note_parts.append(f'prefix: {original_prefix} -> {prefix_to_use}')
-                                if needs_area_change:
-                                    note_parts.append(f'area: {original_area} -> {area_to_use}')
-                                if needs_parent_change:
-                                    note_parts.append(f'parent_letter: {original_parent_letter} -> {parent_to_use}')
-                                if needs_name_change:
-                                    note_parts.append('limpieza NAME')
-                                note = '; '.join(note_parts)
-
-                                if preview_only:
-                                    e = self.log_to_session(fullpath, action_preview, new_full, note)
-                                    self.session_preview.append(e)
-                                else:
-                                    target = safe_unique_path(root_dir, newname)
-                                    try:
-                                        os.rename(fullpath, target)
-                                        e = self.log_to_session(fullpath, action_preview.replace('_PREVIEW',''), target, note)
-                                        self.session_applied.append(e)
-                                        fullpath = target
-                                        fname = os.path.basename(fullpath)
-                                    except Exception as ex:
-                                        e = self.log_to_session(fullpath, 'ERROR_RENOMBRAR', '', str(ex))
-                                        if preview_only:
-                                            self.session_preview.append(e)
-                                        else:
-                                            self.session_applied.append(e)
+                        # Combinar números detectados (name primero, prefix segundo) y añadirlos sufijo al NAME
+                        combined_number_parts = []
+                        if moved_number_from_name:
+                            combined_number_parts.append(moved_number_from_name)
+                        if moved_number_from_prefix:
+                            combined_number_parts.append(moved_number_from_prefix)
+                        if combined_number_parts:
+                            suffix_number = '_'.join(combined_number_parts)
+                            if processed_name_part:
+                                processed_name_part = f"{processed_name_part}{'_' if not processed_name_part.endswith('_') else ''}{suffix_number}"
                             else:
-                                # ya cumple y no necesita limpieza ni cambio
-                                e = self.log_to_session(fullpath, 'VALIDADO_OK', fullpath, 'ya cumple estándar')
-                                if preview_only:
-                                    self.session_preview.append(e)
-                                else:
+                                processed_name_part = suffix_number
+
+                        cleaned_name_part = processed_name_part  # lo que usaremos en reconstrucción
+
+                        # obtener la abreviacion esperada en esta ruta (según el mapeo)
+                        expected_area = find_area_abbr_in_path(root_dir, area_map) or ''
+                        # Solo usar expected_prefix si el pattern lo requiere
+                        expected_prefix = prefix_choice if pattern_has_prefix else original_prefix
+
+                        # obtener la letra de la carpeta inmediata (esperada) sólo si pattern lo requiere
+                        parent_folder = os.path.basename(root_dir) or ''
+                        expected_parent_letter = (parent_folder[0].upper() if parent_folder else '') if pattern_has_parent else original_parent_letter
+
+                        # decidir si debemos cambiar PREFIX/AREA/PARENT_LETTER (o sólo NAME)
+                        needs_prefix_change = pattern_has_prefix and (expected_prefix and original_prefix != expected_prefix)
+                        needs_area_change = (expected_area and original_area != expected_area)
+                        needs_parent_change = pattern_has_parent and (expected_parent_letter and original_parent_letter != expected_parent_letter)
+                        needs_name_change = (cleaned_name_part != original_name_part)
+
+                        if needs_prefix_change or needs_area_change or needs_name_change or needs_parent_change:
+                            # definir variables antes de la reconstrucción (si toca cambiar)
+                            prefix_to_use = expected_prefix if (pattern_has_prefix and expected_prefix) else original_prefix
+                            area_to_use = expected_area if expected_area else original_area
+                            parent_to_use = expected_parent_letter if (pattern_has_parent and expected_parent_letter) else original_parent_letter
+                            ext_to_use = original_ext
+
+                            # reconstruir según el pattern (sustituir placeholders)
+                            newname = pattern
+                            if pattern_has_prefix:
+                                newname = newname.replace('{PREFIX}', prefix_to_use)
+                            newname = newname.replace('{AREA}', area_to_use)
+                            newname = newname.replace('{NAME}', cleaned_name_part)
+                            newname = newname.replace('{EXT}', ext_to_use)
+                            if pattern_has_parent:
+                                newname = newname.replace('{PARENT_LETTER}', parent_to_use)
+                            newname = re.sub(r'\.+', '.', newname).strip('. ')
+                            new_full = os.path.join(root_dir, newname)
+
+                            # log / acciones
+                            action_preview = 'ESTANDARIZAR_REPARAR_PREFIJO_AREA_PREVIEW' if preview_only else 'ESTANDARIZAR_REPARAR_PREFIJO_AREA'
+                            if pattern_has_parent:
+                                action_preview = action_preview.replace('PREFIJO_AREA', 'PREFIJO_AREA_PARENT')
+
+                            note_parts = []
+                            if needs_prefix_change:
+                                note_parts.append(f'prefix: {groups.get("PREFIX","")} -> {prefix_to_use}')
+                            if needs_area_change:
+                                note_parts.append(f'area: {original_area} -> {area_to_use}')
+                            if needs_parent_change:
+                                note_parts.append(f'parent_letter: {original_parent_letter} -> {parent_to_use}')
+                            if needs_name_change:
+                                note_parts.append('limpieza NAME')
+                            note = '; '.join(note_parts)
+
+                            if preview_only:
+                                e = self.log_to_session(fullpath, action_preview, new_full, note)
+                                self.session_preview.append(e)
+                            else:
+                                target = safe_unique_path(root_dir, newname)
+                                try:
+                                    os.rename(fullpath, target)
+                                    e = self.log_to_session(fullpath, action_preview.replace('_PREVIEW',''), target, note)
                                     self.session_applied.append(e)
+                                    fullpath = target
+                                    fname = os.path.basename(fullpath)
+                                except Exception as ex:
+                                    e = self.log_to_session(fullpath, 'ERROR_RENOMBRAR', '', str(ex))
+                                    if preview_only:
+                                        self.session_preview.append(e)
+                                    else:
+                                        self.session_applied.append(e)
+                        else:
+                            # ya cumple y no necesita limpieza ni cambio
+                            e = self.log_to_session(fullpath, 'VALIDADO_OK', fullpath, 'ya cumple estándar')
+                            if preview_only:
+                                self.session_preview.append(e)
+                            else:
+                                self.session_applied.append(e)
                 except Exception as ex:
                     e = self.log_to_session(fullpath, 'ERROR_GENERAL', '', str(ex))
                     if preview_only:
