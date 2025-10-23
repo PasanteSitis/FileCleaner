@@ -104,6 +104,20 @@ def process_name_for_standard(name: str, move_leading_number: bool = True, numbe
 
     return n, moved_number
 
+def capitalize_first_word_keep_underscores(name: str) -> str:
+    """
+    Pone todo en minúsculas y capitaliza sólo la primera letra de la PRIMERA palabra.
+    Palabras separadas por '_' se mantienen así.
+    Ej: 'HOJA_DE_VIDA' -> 'Hoja_de_vida'
+    """
+    if not name:
+        return name
+    lower = name.lower()
+    parts = lower.split('_')
+    if parts:
+        parts[0] = parts[0].capitalize()
+    return '_'.join(parts)
+
 def safe_unique_path(directory: str, filename: str) -> str:
     """Genera una ruta unica en el directorio dado, añadiendo sufijos numericos si es necesario.
 
@@ -211,6 +225,7 @@ def build_standard_name(original_filename: str, folder_path: str,
 
     # 3) normalizar NAME con la función procesadora (extrae también números compuestos si están al inicio)
     processed_name, moved_from_start = process_name_for_standard(rest_name, move_leading_number=True)
+    processed_name = capitalize_first_word_keep_underscores(processed_name)
     # si había número movido del inicio, añadirlo al final (como ya hacíamos)
     number_parts = []
     if moved_from_start:
@@ -237,7 +252,10 @@ def build_standard_name(original_filename: str, folder_path: str,
             if a.lower() == k.lower() or a.lower() == v.lower():
                 found_abbr = v
                 break
-        area_final = found_abbr if found_abbr else a
+        if found_abbr:
+            area_final = found_abbr
+        else:
+            area_final = find_area_abbr_in_path(folder_path, area_abbr_map) or a
     else:
         area_final = find_area_abbr_in_path(folder_path, area_abbr_map) or ''
 
@@ -265,7 +283,6 @@ def build_standard_name(original_filename: str, folder_path: str,
 
     note = f"area:{area_final} parent:{parent_letter}"
     return newname, note
-
 
 # ---------------------------
 # Log persistente: append a XLSX/CSV
@@ -403,19 +420,81 @@ def shorten_path(path: str, show_parts: int = 3) -> str:
 # ---------------------------
 class FileCleanerApp:
     def __init__(self, root):
+        import sys  # <- asegurarse que sys esté importado (también puedes colocarlo arriba del archivo)
         self.root = root
         root.title("File Cleaner & Standardizer - Con log persistente")
         self.session_preview = []  # preview entries
         self.session_applied = []  # applied entries (para escribir luego)
-        # UI
-        frm_top = ttk.Frame(root, padding=8)
-        frm_top.grid(row=0, column=0, sticky='ew')
+
+        # --- MAIN scrollable canvas (envuelve toda la UI) ---
+        root.rowconfigure(0, weight=1)
+        root.columnconfigure(0, weight=1)
+
+        self.main_canvas = tk.Canvas(root)
+        vscroll_main = ttk.Scrollbar(root, orient='vertical', command=self.main_canvas.yview)
+        self.main_canvas.configure(yscrollcommand=vscroll_main.set)
+
+        self.main_canvas.grid(row=0, column=0, sticky='nsew')
+        vscroll_main.grid(row=0, column=1, sticky='ns')
+
+        # frame interior que contendrá toda la UI
+        self.main_frame = ttk.Frame(self.main_canvas)
+        self.canvas_window = self.main_canvas.create_window((0, 0), window=self.main_frame, anchor='nw')
+
+        # ajustar scrollregion cuando cambie el tamaño del contenido
+        def _on_frame_config(e):
+            self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))
+        self.main_frame.bind("<Configure>", _on_frame_config)
+
+        # mantener el ancho del frame interior igual al ancho del canvas (pero solo si cambia)
+        self._last_canvas_width = None
+        def _on_canvas_config(e):
+            # e.width puede ser 1 en algunos momentos; mejor consultar winfo_width
+            w = self.main_canvas.winfo_width()
+            if w <= 1:
+                return
+            if self._last_canvas_width == w:
+                return
+            try:
+                self.main_canvas.itemconfigure(self.canvas_window, width=w)
+            except Exception:
+                pass
+            self._last_canvas_width = w
+        # enlazamos al configure del propio canvas (no al root) para evitar demasiadas llamadas y "parpadeos"
+        self.main_canvas.bind("<Configure>", _on_canvas_config)
+
+        # ----------------------------------------------------
+        # Ahora construimos la UI dentro de self.main_frame
+        # ----------------------------------------------------
+        frm_top = ttk.Frame(self.main_frame, padding=8)
+        frm_top.grid(row=0, column=0, columnspan=2, sticky='ew')
         ttk.Label(frm_top, text="Carpeta raíz:").grid(row=0, column=0, sticky='w')
         self.folder_var = tk.StringVar()
         ttk.Entry(frm_top, textvariable=self.folder_var, width=60).grid(row=0, column=1, padx=6, sticky='ew')
         ttk.Button(frm_top, text="Seleccionar...", command=self.select_folder).grid(row=0, column=2)
 
-        frm_opts = ttk.LabelFrame(root, text="Opciones", padding=8)
+        # SUBDIRS panel
+        frm_subdirs = ttk.LabelFrame(self.main_frame, text="Subcarpetas (seleccionar donde aplicar)", padding=8)
+        frm_subdirs.grid(row=1, column=1, sticky='nsew', padx=8, pady=6)
+        frm_subdirs.columnconfigure(0, weight=1)
+        self.subdirs_canvas = tk.Canvas(frm_subdirs, width=320, height=200)
+        self.subdirs_inner = ttk.Frame(self.subdirs_canvas)
+        vsb = ttk.Scrollbar(frm_subdirs, orient="vertical", command=self.subdirs_canvas.yview)
+        self.subdirs_canvas.configure(yscrollcommand=vsb.set)
+        vsb.grid(row=0, column=1, sticky='ns')
+        self.subdirs_canvas.grid(row=0, column=0, sticky='nsew')
+        self.subdirs_canvas_window = self.subdirs_canvas.create_window((0,0), window=self.subdirs_inner, anchor='nw')
+        self.subdirs_inner.bind("<Configure>", lambda e: self.subdirs_canvas.configure(scrollregion=self.subdirs_canvas.bbox("all")))
+        self.folder_checks = {}
+
+        btns_frame = ttk.Frame(frm_subdirs)
+        btns_frame.grid(row=1, column=0, columnspan=2, pady=(6,0), sticky='ew')
+        ttk.Button(btns_frame, text="Seleccionar todo", command=self.select_all_subdirs).grid(row=0, column=0, padx=2)
+        ttk.Button(btns_frame, text="Deseleccionar todo", command=lambda: self.select_all_subdirs(select=False)).grid(row=0, column=1, padx=2)
+        ttk.Button(btns_frame, text="Invertir", command=self.invert_subdirs).grid(row=0, column=2, padx=2)
+
+        # OPTIONS (izquierda)
+        frm_opts = ttk.LabelFrame(self.main_frame, text="Opciones", padding=8)
         frm_opts.grid(row=1, column=0, sticky='ew', padx=8, pady=6)
         self.delete_vars = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_opts, text="Eliminar archivos temporales/erróneos", variable=self.delete_vars).grid(row=0, column=0, sticky='w')
@@ -424,7 +503,12 @@ class FileCleanerApp:
         self.apply_standard_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(frm_opts, text="Aplicar/validar estándar", variable=self.apply_standard_var).grid(row=2, column=0, sticky='w')
 
-        frm_std = ttk.LabelFrame(root, text="Estándar (pattern)", padding=8)
+        # mantener proporciones de columnas dentro del main_frame
+        self.main_frame.columnconfigure(0, weight=3)
+        self.main_frame.columnconfigure(1, weight=1)
+
+        # STANDARD pattern
+        frm_std = ttk.LabelFrame(self.main_frame, text="Estándar (pattern)", padding=8)
         frm_std.grid(row=2, column=0, sticky='ew', padx=8, pady=6)
         ttk.Label(frm_std, text="Pattern (placeholders: {PREFIX},{AREA},{NAME},{EXT},{PARENT_LETTER}):").grid(row=0, column=0, sticky='w')
         self.pattern_var = tk.StringVar(value="{PARENT_LETTER}.{AREA}.{NAME}.{EXT}")
@@ -433,13 +517,15 @@ class FileCleanerApp:
         self.prefix_var = tk.StringVar(value="P")
         ttk.Entry(frm_std, textvariable=self.prefix_var, width=10).grid(row=3, column=0, sticky='w', pady=4)
 
-        frm_map = ttk.LabelFrame(root, text="Mapeo de áreas -> abreviación (línea por línea 'NombreCarpeta:ABR')", padding=8)
+        # MAPPING
+        frm_map = ttk.LabelFrame(self.main_frame, text="Mapeo de áreas -> abreviación (línea por línea 'NombreCarpeta:ABR')", padding=8)
         frm_map.grid(row=3, column=0, sticky='ew', padx=8, pady=6)
         self.map_text = scrolledtext.ScrolledText(frm_map, height=6, width=80)
         self.map_text.insert('1.0', "Gestión Humana:CP\nAdministración del personal:AP\nContratacion de Personal:CP")
         self.map_text.grid(row=0, column=0)
 
-        frm_log = ttk.LabelFrame(root, text="Archivo de log (persistente)", padding=8)
+        # LOG path
+        frm_log = ttk.LabelFrame(self.main_frame, text="Archivo de log (persistente)", padding=8)
         frm_log.grid(row=4, column=0, sticky='ew', padx=8, pady=6)
         ttk.Label(frm_log, text="Ruta archivo log (.xlsx o .csv):").grid(row=0, column=0, sticky='w')
         self.log_path_var = tk.StringVar()
@@ -447,48 +533,133 @@ class FileCleanerApp:
         ttk.Button(frm_log, text="Seleccionar/Crear archivo log...", command=self.select_log_file).grid(row=1, column=1, padx=6)
         ttk.Label(frm_log, text="(Si no existe, se creará. Si no tienes pandas se usará CSV)").grid(row=2, column=0, sticky='w', pady=4)
 
-        frm_buttons = ttk.Frame(root, padding=8)
-        frm_buttons.grid(row=5, column=0, sticky='ew')
+        # BUTTONS
+        frm_buttons = ttk.Frame(self.main_frame, padding=8)
+        frm_buttons.grid(row=5, column=0, columnspan=2, sticky='ew')
         ttk.Button(frm_buttons, text="Generar vista previa", command=lambda: self.run_scan(mode='preview')).grid(row=0, column=0, padx=6)
         ttk.Button(frm_buttons, text="Aplicar cambios (escribirá en disco y actualizará log)", command=lambda: self.run_scan(mode='apply')).grid(row=0, column=1, padx=6)
         ttk.Button(frm_buttons, text="Exportar log sesión (temporal)", command=self.export_session_log).grid(row=0, column=2, padx=6)
         ttk.Button(frm_buttons, text="Limpiar panel", command=self.clear_panel).grid(row=0, column=3, padx=6)
 
-        frm_result = ttk.LabelFrame(root, text="Resultados / Acciones detectadas", padding=8)
-        frm_result.grid(row=6, column=0, sticky='nsew', padx=8, pady=6)
+        # RESULTADOS - ocupando ancho completo
+        frm_result = ttk.LabelFrame(self.main_frame, text="Resultados / Acciones detectadas", padding=8)
+        frm_result.grid(row=6, column=0, columnspan=2, sticky='nsew', padx=8, pady=6)
         frm_result.rowconfigure(0, weight=1)
         frm_result.columnconfigure(0, weight=1)
-        root.rowconfigure(6, weight=1)
-        root.columnconfigure(0, weight=1)
-        self.tree = ttk.Treeview(frm_result, columns=('timestamp','original', 'action', 'new', 'note'), show='headings', height=14)
-        self.tree.grid(row=0, column=0, sticky='nsew')
-        scrollbar = ttk.Scrollbar(frm_result, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=scrollbar.set)
-        scrollbar.grid(row=0, column=1, sticky='ns')
+
+        self.tree = ttk.Treeview(frm_result, columns=('timestamp','original', 'action', 'new', 'note'),
+                                show='headings', height=28)
+        self.tree.grid(row=0, column=0, sticky='nsew', padx=(0,0), pady=(0,0))
+
+        # barras
+        vsb2 = ttk.Scrollbar(frm_result, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscroll=vsb2.set)
+        vsb2.grid(row=0, column=1, sticky='ns')
+        hsb2 = ttk.Scrollbar(frm_result, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(xscroll=hsb2.set)
+        hsb2.grid(row=1, column=0, columnspan=2, sticky='ew')
+
+        # encabezados y columnas
         self.tree.heading('timestamp', text='Timestamp')
         self.tree.heading('original', text='Archivo original')
         self.tree.heading('action', text='Acción')
         self.tree.heading('new', text='Nuevo / Ruta')
         self.tree.heading('note', text='Nota')
-        self.tree.column('timestamp', width=140)
-        self.tree.column('original', width=420)
-        self.tree.column('action', width=120)
-        self.tree.column('new', width=320)
-        self.tree.column('note', width=220)
-        self.tree.grid(row=0, column=0, sticky='nsew')
-        scrollbar = ttk.Scrollbar(frm_result, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscroll=scrollbar.set)
-        scrollbar.grid(row=0, column=1, sticky='ns')
-        hsb = ttk.Scrollbar(frm_result, orient=tk.HORIZONTAL, command=self.tree.xview)
-        self.tree.configure(xscroll=hsb.set)
-        hsb.grid(row=1, column=0, columnspan=2, sticky='ew')
-        frm_result.rowconfigure(1, weight=0) 
+        self.tree.column('timestamp', width=160, stretch=False)
+        self.tree.column('original', width=700, stretch=True)
+        self.tree.column('action', width=140, stretch=False)
+        self.tree.column('new', width=480, stretch=True)
+        self.tree.column('note', width=300, stretch=True)
+
+        # ---------------------------
+        # MOUSE WHEEL: comportamiento por plataforma
+        # ---------------------------
+        # objetivo del scroll: si el cursor está sobre tree => scroll tree,
+        # si está sobre subdirs_canvas => scroll subdirs, sino scroll main_canvas.
+
+        self._wheel_target = None
+
+        def _enter_widget(e):
+            # guardamos la referencia del widget donde está el cursor
+            self._wheel_target = e.widget
+
+        def _leave_widget(e):
+            # solo limpiar si se sale del widget trackeado
+            if self._wheel_target == e.widget:
+                self._wheel_target = None
+
+        # bind enter/leave para widgets relevantes
+        widgets_for_wheel = [self.main_canvas, self.subdirs_canvas, self.subdirs_inner, self.tree]
+        for w in widgets_for_wheel:
+            try:
+                w.bind("<Enter>", _enter_widget, add=True)
+                w.bind("<Leave>", _leave_widget, add=True)
+            except Exception:
+                pass
+
+        import platform
+        is_linux = platform.system().lower().startswith('linux')
+
+        def _mousewheel_handler(event):
+            # decidir destino
+            if self._wheel_target is not None:
+                tgt = self._wheel_target
+            else:
+                tgt = self.main_canvas
+
+            # eventos distintos según plataforma
+            if is_linux:
+                # en X11 los eventos son Button-4 (up) / Button-5 (down) y no usan event.delta
+                return  # handled elsewhere by button bindings
+            else:
+                # Windows / macOS usan MouseWheel con event.delta
+                if tgt == self.tree:
+                    if sys.platform.startswith('win'):
+                        self.tree.yview_scroll(-1 * (event.delta // 120), "units")
+                    else:
+                        # macOS suele usar event.delta con valores pequeños
+                        self.tree.yview_scroll(-1 * int(event.delta), "units")
+                elif tgt == self.subdirs_canvas or tgt == self.subdirs_inner:
+                    if sys.platform.startswith('win'):
+                        self.subdirs_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+                    else:
+                        self.subdirs_canvas.yview_scroll(-1 * int(event.delta), "units")
+                else:
+                    if sys.platform.startswith('win'):
+                        self.main_canvas.yview_scroll(-1 * (event.delta // 120), "units")
+                    else:
+                        self.main_canvas.yview_scroll(-1 * int(event.delta), "units")
+
+        # para Windows / macOS enlazamos MouseWheel globalmente (pero actuará según self._wheel_target)
+        root.bind_all("<MouseWheel>", _mousewheel_handler)
+
+        # para Linux (X11) enlazamos Button-4 / Button-5 (rueda)
+        def _linux_scroll_up(e):
+            tgt = self._wheel_target or self.main_canvas
+            if tgt == self.tree:
+                self.tree.yview_scroll(-1, "units")
+            elif tgt == self.subdirs_canvas or tgt == self.subdirs_inner:
+                self.subdirs_canvas.yview_scroll(-1, "units")
+            else:
+                self.main_canvas.yview_scroll(-1, "units")
+        def _linux_scroll_down(e):
+            tgt = self._wheel_target or self.main_canvas
+            if tgt == self.tree:
+                self.tree.yview_scroll(1, "units")
+            elif tgt == self.subdirs_canvas or tgt == self.subdirs_inner:
+                self.subdirs_canvas.yview_scroll(1, "units")
+            else:
+                self.main_canvas.yview_scroll(1, "units")
+
+        root.bind_all("<Button-4>", _linux_scroll_up)
+        root.bind_all("<Button-5>", _linux_scroll_down)
 
     def select_folder(self):
-        """Muestra diálogo para seleccionar carpeta raíz."""
+        """Muestra diálogo para seleccionar carpeta raíz y poblar subcarpetas."""
         folder = filedialog.askdirectory()
         if folder:
             self.folder_var.set(folder)
+            self.populate_folder_checkboxes(folder)
 
     def select_log_file(self):
         """Muestra diálogo para seleccionar o crear archivo de log (.xlsx o .csv)."""
@@ -586,8 +757,26 @@ class FileCleanerApp:
         pattern_has_prefix = '{PREFIX}' in pattern
         pattern_has_parent = '{PARENT_LETTER}' in pattern
 
+        selected_dirs = [os.path.normcase(os.path.abspath(k)) for k, v in self.folder_checks.items() if v.get()]
+        any_selected = len(selected_dirs) > 0
+        
         # recorrer
         for root_dir, dirs, files in os.walk(folder):
+            # normalizar current root
+            root_norm = os.path.normcase(os.path.abspath(root_dir))
+
+            # Si hay subcarpetas seleccionadas, sólo procesar si root_dir está dentro de alguna seleccionada.
+            if any_selected:
+                ok = False
+                for sd in selected_dirs:
+                    # coincidencia exacta o subruta: sd == root_norm or root_norm startswith sd + sep
+                    if root_norm == sd or root_norm.startswith(sd + os.sep):
+                        ok = True
+                        break
+                if not ok:
+                    # saltar este root_dir por completo
+                    continue
+            
             for fname in files:
                 fullpath = os.path.join(root_dir, fname)
                 try:
@@ -628,6 +817,7 @@ class FileCleanerApp:
                             # si hay número movido, agregarlo al final del NAME
                             if moved_number:
                                 processed_name_part = f"{processed_name_part}{'_' if not processed_name_part.endswith('_') else ''}{moved_number}"
+                            processed_name_part = capitalize_first_word_keep_underscores(processed_name_part)
                             cleaned_name_part = processed_name_part
                             if cleaned_name_part != original_name_part:
                                 # reconstruir usando los grupos originales (no alteramos prefix/area/parent/ext aquí)
@@ -838,6 +1028,49 @@ class FileCleanerApp:
             else:
                 messagebox.showinfo("Vista previa generada", "Se generó la vista previa en el panel (no se modificó nada).")
 
+    def clear_folder_checkboxes(self):
+        """Remueve todos los checkbuttons y variables previas."""
+        for widget in self.subdirs_inner.winfo_children():
+            widget.destroy()
+        self.folder_checks.clear()
+
+    def populate_folder_checkboxes(self, root_folder: str):
+        """Lista subcarpetas de primer nivel y crea checkbuttons para cada una."""
+        self.clear_folder_checkboxes()
+        try:
+            # listar solo carpetas de primer nivel
+            with os.scandir(root_folder) as it:
+                dirs = [entry for entry in it if entry.is_dir()]
+        except Exception:
+            dirs = []
+
+        # si no hay subcarpetas, mostrar la del mismo root (opcional)
+        if not dirs:
+            # mostrar la propia carpeta raíz como opción
+            var = tk.BooleanVar(value=True)
+            cb = ttk.Checkbutton(self.subdirs_inner, text=os.path.basename(root_folder) or root_folder, variable=var)
+            cb.pack(anchor='w', pady=2, padx=2)
+            self.folder_checks[os.path.abspath(root_folder)] = var
+            return
+
+        # crear checkbuttons ordenadas por nombre
+        for d in sorted(dirs, key=lambda x: x.name.lower()):
+            path_abs = os.path.abspath(d.path)
+            var = tk.BooleanVar(value=True)  # por defecto: seleccionadas
+            label = f"{d.name}"
+            cb = ttk.Checkbutton(self.subdirs_inner, text=label, variable=var)
+            cb.pack(anchor='w', pady=1, padx=2)
+            self.folder_checks[path_abs] = var
+
+    def select_all_subdirs(self, select=True):
+        """Seleccionar o deseleccionar todas las subcarpetas en la lista."""
+        for v in self.folder_checks.values():
+            v.set(select)
+
+    def invert_subdirs(self):
+        """Invertir selección."""
+        for v in self.folder_checks.values():
+            v.set(not v.get())
 # ---------------------------
 # Ejecutar
 # ---------------------------
